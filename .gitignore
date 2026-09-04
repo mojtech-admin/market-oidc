@@ -1,0 +1,4 @@
+.streamlit/secrets.toml
+*.pyc
+__pycache__/
+.traffic_lights_yagee_state.json
