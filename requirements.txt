@@ -1,4 +1,5 @@
 streamlit>=1.47
+Authlib>=1.3.2
 yfinance>=0.2.54
 pandas>=2.0
 numpy>=1.26
