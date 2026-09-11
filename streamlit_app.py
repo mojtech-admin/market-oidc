@@ -4,6 +4,7 @@ import json
 import re
 import requests
 from pathlib import Path
+from datetime import datetime, timezone
 from typing import Dict, List
 
 import pandas as pd
@@ -17,7 +18,7 @@ import traffic_lights_core as tl
 # =============================================================================
 
 st.set_page_config(
-    page_title="Market & Stock Traffic Lights",
+    page_title="Smart Market",
     page_icon="🚦",
     layout="wide",
 )
@@ -149,7 +150,7 @@ def oidc_login_gate() -> str:
         st.stop()
 
     if not logged_in:
-        st.title("🚦 Market & Stock Traffic Lights")
+        st.title("🚦 Smart Market")
         st.write("Sign in once with Google to continue.")
         if st.button("Sign in with Google", type="primary"):
             st.login()
@@ -168,12 +169,19 @@ def oidc_login_gate() -> str:
 
 
 def supabase_headers() -> Dict[str, str]:
-    key = str(_secret_value("supabase", "service_role_key"))
-    return {
+    """Headers for Supabase REST requests.
+
+    New Supabase sb_secret_ keys are sent via apikey. Legacy JWT service-role
+    keys also receive the Authorization bearer header for compatibility.
+    """
+    key = str(_secret_value("supabase", "service_role_key")).strip()
+    headers = {
         "apikey": key,
-        "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
     }
+    if not key.startswith("sb_secret_"):
+        headers["Authorization"] = f"Bearer {key}"
+    return headers
 
 
 def supabase_url(path: str) -> str:
@@ -181,14 +189,24 @@ def supabase_url(path: str) -> str:
     return f"{base}/rest/v1/{path.lstrip('/')}"
 
 
-def get_user_access_status(email: str) -> str:
-    """
-    Return pending/approved/denied. A first-time Google user is automatically
-    recorded as pending for administrator review in Supabase.
-    """
+def _parse_ts(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def get_user_access_record(email: str) -> Dict:
+    """Return the user's access record, creating a pending record if needed."""
     params = {
         "email": f"eq.{email}",
-        "select": "email,status",
+        "select": (
+            "email,name,status,approved_at,trial_started_at,trial_ends_at,"
+            "subscription_status,stripe_customer_id,stripe_subscription_id,"
+            "subscription_current_period_end"
+        ),
         "limit": "1",
     }
     r = requests.get(
@@ -201,46 +219,165 @@ def get_user_access_status(email: str) -> str:
     rows = r.json()
 
     if rows:
-        return str(rows[0].get("status", "pending")).lower()
+        return rows[0]
 
     name = str(getattr(st.user, "name", "") or "")
     payload = {"email": email, "name": name, "status": "pending"}
     r = requests.post(
         supabase_url("app_users"),
-        headers={**supabase_headers(), "Prefer": "return=minimal"},
+        headers={**supabase_headers(), "Prefer": "return=representation"},
         json=payload,
         timeout=15,
     )
     r.raise_for_status()
-    return "pending"
+    created = r.json()
+    return created[0] if created else payload
 
 
-def access_approval_gate(email: str) -> None:
+def _initialize_trial_if_missing(record: Dict) -> Dict:
+    """Safety fallback for approved users created before the trial migration."""
+    if record.get("status") != "approved" or record.get("trial_ends_at"):
+        return record
+
+    now = datetime.now(timezone.utc)
+    from datetime import timedelta
+    trial_end = now + timedelta(days=30)
+    payload = {
+        "approved_at": record.get("approved_at") or now.isoformat(),
+        "trial_started_at": record.get("trial_started_at") or now.isoformat(),
+        "trial_ends_at": trial_end.isoformat(),
+    }
+    r = requests.patch(
+        supabase_url("app_users"),
+        headers={**supabase_headers(), "Prefer": "return=representation"},
+        params={"email": f"eq.{record['email']}"},
+        json=payload,
+        timeout=15,
+    )
+    r.raise_for_status()
+    rows = r.json()
+    return rows[0] if rows else {**record, **payload}
+
+
+def _subscription_checkout_url() -> str:
     try:
-        status = get_user_access_status(email)
+        return str(st.secrets["stripe"].get("checkout_url", "") or "").strip()
+    except Exception:
+        return ""
+
+
+def render_subscription_screen(email: str, record: Dict) -> None:
+    st.title("🚦 Smart Market")
+    st.markdown("## Continue your access")
+    st.write("Your 30-day introductory access period has ended.")
+
+    st.markdown(
+        """
+        <div style="max-width:620px;padding:1.5rem 1.6rem;border:1px solid #444;"
+        "border-radius:1rem;margin:1rem 0 1.25rem 0;">
+          <div style="font-size:1.1rem;font-weight:700;">MOJ Market Subscription</div>
+          <div style="font-size:2rem;font-weight:800;margin-top:.35rem;">$49.99/month</div>
+          <div style="margin-top:.6rem;opacity:.88;">Full access to the market and stock traffic-light dashboard and your saved universe.</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    checkout_url = _subscription_checkout_url()
+    if checkout_url:
+        st.link_button(
+            "Subscribe — $49.99/month",
+            checkout_url,
+            type="primary",
+            use_container_width=True,
+        )
+        st.caption("Secure checkout is handled by Stripe.")
+    else:
+        st.button("Subscribe — $49.99/month", type="primary", disabled=True, use_container_width=True)
+        st.info("Stripe checkout is being connected. Your subscription option will appear here once configured.")
+
+    st.caption(f"Signed in as {email}")
+    if st.button("Sign out"):
+        st.logout()
+    st.stop()
+
+
+def access_gate(email: str) -> Dict:
+    """Enforce admin approval, 30-day trial, and subscription access."""
+    try:
+        record = get_user_access_record(email)
+        record = _initialize_trial_if_missing(record)
     except Exception as exc:
         st.error("The user-access service is unavailable.")
         st.caption(str(exc))
         st.stop()
 
-    if status == "approved":
-        return
-
-    st.title("🚦 Market & Stock Traffic Lights")
+    status = str(record.get("status", "pending")).lower()
 
     if status == "denied":
+        st.title("🚦 Smart Market")
         st.error("Access to this app has not been approved for this account.")
-    else:
+        if st.button("Sign out"):
+            st.logout()
+        st.stop()
+
+    if status != "approved":
+        st.title("🚦 Smart Market")
         st.warning(
             "Your Google account is verified, but access is awaiting administrator approval."
         )
         st.write(f"Signed in as **{email}**")
         if st.button("Check access again"):
             st.rerun()
+        if st.button("Sign out"):
+            st.logout()
+        st.stop()
 
-    if st.button("Sign out"):
-        st.logout()
-    st.stop()
+    subscription_status = str(record.get("subscription_status") or "inactive").lower()
+    if subscription_status in {"active", "trialing"}:
+        return record
+
+    trial_ends_at = _parse_ts(record.get("trial_ends_at"))
+    now = datetime.now(timezone.utc)
+    if trial_ends_at and now < trial_ends_at:
+        return record
+
+    render_subscription_screen(email, record)
+    return record
+
+
+def render_trial_status(record: Dict) -> None:
+    if str(record.get("subscription_status") or "inactive").lower() in {"active", "trialing"}:
+        st.success("Subscription active")
+        return
+
+    trial_end = _parse_ts(record.get("trial_ends_at"))
+    if not trial_end:
+        return
+    now = datetime.now(timezone.utc)
+    seconds = max(0, int((trial_end - now).total_seconds()))
+    days = (seconds + 86399) // 86400
+    if days > 0:
+        st.caption(f"Introductory access: {days} day{'s' if days != 1 else ''} remaining")
+
+def render_membership_status(record: Dict) -> None:
+    """Render compact membership status for the main page header."""
+    subscription_status = str(record.get("subscription_status") or "inactive").lower()
+
+    if subscription_status in {"active", "trialing"}:
+        label = "Subscribed member"
+    else:
+        trial_end = _parse_ts(record.get("trial_ends_at"))
+        now = datetime.now(timezone.utc)
+        if trial_end and now < trial_end:
+            label = f"Free trial until {trial_end.strftime('%b %d, %Y')}"
+        else:
+            label = "Subscription required"
+
+    st.markdown(
+        f"<div style='text-align:right;font-weight:600;padding-top:0.7rem;'>{label}</div>",
+        unsafe_allow_html=True,
+    )
 
 
 def load_saved_symbols(email: str) -> set[str]:
@@ -586,7 +723,7 @@ def render_stock_section(detail: Dict) -> None:
 # Main app
 # =============================================================================
 user_email = oidc_login_gate()
-access_approval_gate(user_email)
+access_record = access_gate(user_email)
 
 try:
     saved_symbols = load_saved_symbols(user_email)
@@ -597,7 +734,12 @@ except Exception as exc:
 
 current_universe = sorted(set(UNIVERSE) | saved_symbols)
 
-st.title("🚦 Market & Stock Traffic Lights")
+title_col, status_col = st.columns([3, 2])
+with title_col:
+    st.title("🚦 Smart Market")
+with status_col:
+    render_membership_status(access_record)
+
 st.caption(
     "Traffic-light output is a decision-support tool, not a guarantee of market direction "
     "or investment outcome."
@@ -605,6 +747,7 @@ st.caption(
 
 with st.sidebar:
     st.caption(f"Signed in as {user_email}")
+    render_trial_status(access_record)
     if st.button("Sign out"):
         st.logout()
 

@@ -1,4 +1,4 @@
-# Market & Stock Traffic Lights — Google OIDC + My Universe
+# Smart Market — Google OIDC + My Universe
 
 ## What changed
 
