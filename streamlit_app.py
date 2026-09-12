@@ -350,6 +350,37 @@ def confirm_checkout_return(email: str) -> None:
         st.caption(str(exc))
 
 
+
+def _stripe_subscription_period_end(subscription) -> Optional[datetime]:
+    """Return the current billing-period end using modern Stripe item-level fields.
+
+    Stripe API versions from Basil onward moved current_period_end from the
+    top-level Subscription object to subscription items. Fall back to the
+    legacy top-level field for compatibility with older API versions.
+    """
+    ts = None
+    try:
+        items = getattr(subscription, "items", None)
+        data = getattr(items, "data", None) if items is not None else None
+        if data:
+            first = data[0]
+            ts = getattr(first, "current_period_end", None)
+            if ts is None and isinstance(first, dict):
+                ts = first.get("current_period_end")
+    except Exception:
+        ts = None
+
+    if ts is None:
+        try:
+            ts = getattr(subscription, "current_period_end", None)
+        except Exception:
+            ts = None
+    if ts is None and isinstance(subscription, dict):
+        ts = subscription.get("current_period_end")
+
+    return datetime.fromtimestamp(int(ts), tz=timezone.utc) if ts else None
+
+
 def sync_subscription_from_stripe(email: str, record: Dict) -> Dict:
     sub_id = str(record.get("stripe_subscription_id") or "").strip()
     if not sub_id:

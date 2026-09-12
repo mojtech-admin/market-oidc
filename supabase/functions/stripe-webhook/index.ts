@@ -4,6 +4,19 @@ import { withSupabase } from 'npm:@supabase/server@^1'
 const stripe = new Stripe(Deno.env.get('STRIPE_SECRET_KEY') as string)
 const cryptoProvider = Stripe.createSubtleCryptoProvider()
 
+
+function getSubscriptionCurrentPeriodEnd(subscription: any): number | null {
+  // Stripe API versions from Basil onward expose current_period_end on
+  // subscription items instead of the top-level Subscription object.
+  const itemPeriodEnd =
+    subscription?.items?.data?.[0]?.current_period_end ?? null;
+
+  if (itemPeriodEnd) return itemPeriodEnd;
+
+  // Backward-compatible fallback for older Stripe API versions.
+  return subscription?.current_period_end ?? null;
+}
+
 function isoFromUnix(value: number | null | undefined): string | null {
   if (!value) return null
   return new Date(value * 1000).toISOString()
@@ -89,7 +102,7 @@ async function persistSubscription(
     subscription_status: subscription.status,
     stripe_subscription_id: subscription.id,
     stripe_customer_id: stringId(subscription.customer),
-    subscription_current_period_end: isoFromUnix(subscription.current_period_end),
+    subscription_current_period_end: isoFromUnix(getSubscriptionCurrentPeriodEnd(subscription)),
     subscription_cancel_at_period_end: Boolean(subscription.cancel_at_period_end),
   }
 

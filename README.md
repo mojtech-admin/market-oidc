@@ -157,3 +157,13 @@ The Edge Function requires two project secrets:
 The function itself must be publicly callable (`verify_jwt = false`) because
 Stripe does not send a Supabase user JWT. Authenticity is enforced by verifying
 the `Stripe-Signature` header against the signing secret.
+
+
+## v9 — Stripe current billing-period compatibility
+
+Stripe API versions from Basil onward moved `current_period_end` from the top-level
+Subscription object to each subscription item. v9 reads the billing-period end from
+`subscription.items.data[0].current_period_end`, with a legacy fallback for older
+Stripe API versions. This fix is applied both to the Streamlit Stripe sync and the
+Supabase `stripe-webhook` Edge Function. No new Supabase migration is required.
+
