@@ -560,7 +560,7 @@ def access_gate(email: str) -> Dict:
 
     # Existing subscriptions with a collection/payment problem go to billing
     # recovery rather than the dashboard or a second Checkout subscription.
-    if subscription_status in {"past_due", "unpaid", "incomplete"}:
+    if subscription_status in {"past_due", "unpaid", "incomplete", "paused"}:
         render_payment_recovery_screen(email, record)
 
     # Canceled / incomplete_expired / inactive users can still use any

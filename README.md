@@ -121,3 +121,39 @@ of the market dashboard. No database migration is required beyond the included
 For production, Stripe webhooks are still recommended so Supabase is updated even
 when a user is not actively visiting the app.
 
+
+## Stripe webhook (v8)
+
+This version adds a Supabase Edge Function at:
+
+`supabase/functions/stripe-webhook/index.ts`
+
+and function configuration at:
+
+`supabase/config.toml`
+
+The webhook verifies Stripe's signature and synchronizes Stripe subscription
+state into `public.app_users`. It handles:
+
+- `checkout.session.completed`
+- `customer.subscription.created`
+- `customer.subscription.updated`
+- `customer.subscription.deleted`
+- `invoice.paid`
+- `invoice.payment_failed`
+
+Before enabling the webhook, run:
+
+`supabase_subscription_status_migration_v2.sql`
+
+This expands the database constraint to accept Stripe states including
+`incomplete`, `unpaid`, and `paused`.
+
+The Edge Function requires two project secrets:
+
+- `STRIPE_SECRET_KEY` — the same Stripe sandbox/live secret key used by the app
+- `STRIPE_WEBHOOK_SIGNING_SECRET` — the `whsec_...` secret from the Stripe webhook endpoint
+
+The function itself must be publicly callable (`verify_jwt = false`) because
+Stripe does not send a Supabase user JWT. Authenticity is enforced by verifying
+the `Stripe-Signature` header against the signing secret.
