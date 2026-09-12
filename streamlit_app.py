@@ -391,6 +391,66 @@ def resume_subscription(email: str, record: Dict) -> Dict:
     updated = _update_subscription_record(email, fields)
     return {**record, **updated}
 
+
+def create_customer_portal_session(record: Dict):
+    """Create a Stripe-hosted Customer Portal session for billing recovery."""
+    customer_id = str(record.get("stripe_customer_id") or "").strip()
+    if not customer_id:
+        raise RuntimeError("No Stripe customer is associated with this account.")
+
+    stripe.api_key = _stripe_secret_key()
+    return stripe.billing_portal.Session.create(
+        customer=customer_id,
+        return_url=_app_base_url(),
+    )
+
+
+def render_payment_recovery_screen(email: str, record: Dict) -> None:
+    """Block dashboard access while a subscription has a payment problem."""
+    st.title("🚦 Smart Market")
+    st.markdown("## Payment issue")
+    st.warning(
+        "We could not successfully renew your Smart Market subscription. "
+        "Please update your payment method to restore full access."
+    )
+
+    portal_error = None
+    portal_url = None
+    try:
+        portal = create_customer_portal_session(record)
+        portal_url = portal.url
+    except Exception as exc:
+        portal_error = str(exc)
+
+    if portal_url:
+        st.link_button(
+            "Update payment method",
+            portal_url,
+            type="primary",
+            use_container_width=False,
+        )
+    else:
+        st.error("Could not open Stripe billing management.")
+        if portal_error:
+            st.caption(portal_error)
+
+    if st.button("Check payment status"):
+        refreshed = sync_subscription_from_stripe(email, record)
+        refreshed_status = str(refreshed.get("subscription_status") or "inactive").lower()
+        if refreshed_status in {"active", "trialing"}:
+            st.success("Payment status restored.")
+        st.rerun()
+
+    st.caption(
+        "Your account remains signed in, but the market dashboard is unavailable "
+        "until the subscription payment issue is resolved."
+    )
+    st.caption(f"Signed in as {email}")
+    if st.button("Sign out", key="payment_issue_signout"):
+        st.logout()
+    st.stop()
+
+
 def render_subscription_screen(email: str, record: Dict) -> None:
     st.title("🚦 Smart Market")
     st.markdown("## Continue your access")
@@ -461,7 +521,7 @@ def render_subscription_screen(email: str, record: Dict) -> None:
 
 
 def access_gate(email: str) -> Dict:
-    """Enforce admin approval, 30-day trial, and subscription access."""
+    """Enforce admin approval, trial access, subscription access, and billing recovery."""
     try:
         record = get_user_access_record(email)
         record = _initialize_trial_if_missing(record)
@@ -491,11 +551,20 @@ def access_gate(email: str) -> Dict:
             st.logout()
         st.stop()
 
+    # Stripe is the source of truth whenever a subscription already exists.
     record = sync_subscription_from_stripe(email, record)
     subscription_status = str(record.get("subscription_status") or "inactive").lower()
+
     if subscription_status in {"active", "trialing"}:
         return record
 
+    # Existing subscriptions with a collection/payment problem go to billing
+    # recovery rather than the dashboard or a second Checkout subscription.
+    if subscription_status in {"past_due", "unpaid", "incomplete"}:
+        render_payment_recovery_screen(email, record)
+
+    # Canceled / incomplete_expired / inactive users can still use any
+    # unexpired introductory trial; otherwise they see the normal Subscribe flow.
     trial_ends_at = _parse_ts(record.get("trial_ends_at"))
     now = datetime.now(timezone.utc)
     if trial_ends_at and now < trial_ends_at:

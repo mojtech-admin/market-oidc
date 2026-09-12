@@ -108,3 +108,16 @@ The subscription CTA is capped at 620px on desktop and remains responsive/full-w
 
 ## Stripe checkout v4
 Subscribed users now have a Cancel subscription control in the sidebar. Cancellation is scheduled at the end of the current Stripe billing period so access continues through the paid period.
+
+
+## Subscription state handling (v7)
+
+The app handles trial, active, cancellation-at-period-end, resumed, expired/canceled,
+and Stripe payment-recovery states. Stripe statuses `past_due`, `unpaid`, and
+`incomplete` are routed to a Stripe Customer Portal payment-recovery screen instead
+of the market dashboard. No database migration is required beyond the included
+30-day trial and cancellation migrations.
+
+For production, Stripe webhooks are still recommended so Supabase is updated even
+when a user is not actively visiting the app.
+
