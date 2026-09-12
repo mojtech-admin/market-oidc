@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import requests
+import stripe
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, List
@@ -259,11 +260,107 @@ def _initialize_trial_if_missing(record: Dict) -> Dict:
     return rows[0] if rows else {**record, **payload}
 
 
-def _subscription_checkout_url() -> str:
+def _stripe_secret_key() -> str:
+    return str(_secret_value("stripe", "secret_key")).strip()
+
+
+def _stripe_price_id() -> str:
+    return str(_secret_value("stripe", "price_id")).strip()
+
+
+def _app_base_url() -> str:
     try:
-        return str(st.secrets["stripe"].get("checkout_url", "") or "").strip()
+        configured = str(st.secrets["stripe"].get("app_url", "") or "").strip().rstrip("/")
     except Exception:
-        return ""
+        configured = ""
+    return configured or "https://mojmarket.streamlit.app"
+
+
+def _stripe_subscription_fields(subscription) -> Dict:
+    status = str(getattr(subscription, "status", "") or "inactive").lower()
+    current_period_end = getattr(subscription, "current_period_end", None)
+    if current_period_end:
+        current_period_end = datetime.fromtimestamp(int(current_period_end), tz=timezone.utc).isoformat()
+    return {
+        "subscription_status": status,
+        "stripe_subscription_id": str(getattr(subscription, "id", "") or ""),
+        "stripe_customer_id": str(getattr(subscription, "customer", "") or ""),
+        "subscription_current_period_end": current_period_end,
+    }
+
+
+def _update_subscription_record(email: str, fields: Dict) -> Dict:
+    r = requests.patch(
+        supabase_url("app_users"),
+        headers={**supabase_headers(), "Prefer": "return=representation"},
+        params={"email": f"eq.{email}"},
+        json=fields,
+        timeout=15,
+    )
+    r.raise_for_status()
+    rows = r.json()
+    return rows[0] if rows else fields
+
+
+def create_checkout_session(email: str):
+    stripe.api_key = _stripe_secret_key()
+    base = _app_base_url()
+    return stripe.checkout.Session.create(
+        mode="subscription",
+        line_items=[{"price": _stripe_price_id(), "quantity": 1}],
+        customer_email=email,
+        client_reference_id=email,
+        success_url=f"{base}/?checkout=success&session_id={{CHECKOUT_SESSION_ID}}",
+        cancel_url=f"{base}/?checkout=cancelled",
+        allow_promotion_codes=False,
+        subscription_data={"metadata": {"user_email": email}},
+        metadata={"user_email": email},
+    )
+
+
+def confirm_checkout_return(email: str) -> None:
+    params = st.query_params
+    if params.get("checkout") != "success":
+        return
+
+    session_id = params.get("session_id")
+    if not session_id:
+        return
+
+
+    try:
+        stripe.api_key = _stripe_secret_key()
+        session = stripe.checkout.Session.retrieve(session_id, expand=["subscription"])
+        session_email = str(getattr(session, "client_reference_id", "") or "").strip().lower()
+        if session_email != email:
+            raise RuntimeError("Checkout session does not belong to the signed-in user.")
+
+        subscription = getattr(session, "subscription", None)
+        if not subscription:
+            raise RuntimeError("Stripe did not return a subscription for this checkout session.")
+
+        fields = _stripe_subscription_fields(subscription)
+        _update_subscription_record(email, fields)
+        st.query_params.clear()
+        st.success("Subscription activated. Welcome to Smart Market.")
+        st.rerun()
+    except Exception as exc:
+        st.error("Your payment was received, but subscription verification could not be completed.")
+        st.caption(str(exc))
+
+
+def sync_subscription_from_stripe(email: str, record: Dict) -> Dict:
+    sub_id = str(record.get("stripe_subscription_id") or "").strip()
+    if not sub_id:
+        return record
+    try:
+        stripe.api_key = _stripe_secret_key()
+        subscription = stripe.Subscription.retrieve(sub_id)
+        fields = _stripe_subscription_fields(subscription)
+        updated = _update_subscription_record(email, fields)
+        return {**record, **updated}
+    except Exception:
+        return record
 
 
 def render_subscription_screen(email: str, record: Dict) -> None:
@@ -283,18 +380,15 @@ def render_subscription_screen(email: str, record: Dict) -> None:
         unsafe_allow_html=True,
     )
 
-    checkout_url = _subscription_checkout_url()
-    if checkout_url:
-        st.link_button(
-            "Subscribe — $49.99/month",
-            checkout_url,
-            type="primary",
-            use_container_width=True,
-        )
-        st.caption("Secure checkout is handled by Stripe.")
-    else:
-        st.button("Subscribe — $49.99/month", type="primary", disabled=True, use_container_width=True)
-        st.info("Stripe checkout is being connected. Your subscription option will appear here once configured.")
+    if st.button("Subscribe — $49.99/month", type="primary", use_container_width=True):
+        try:
+            session = create_checkout_session(email)
+            st.markdown(f'<meta http-equiv="refresh" content="0; url={session.url}">', unsafe_allow_html=True)
+            st.link_button("Continue to secure Stripe checkout", session.url, type="primary", use_container_width=True)
+        except Exception as exc:
+            st.error("Could not start Stripe checkout.")
+            st.caption(str(exc))
+    st.caption("Secure checkout is handled by Stripe. Card, Apple Pay, and Google Pay may appear when supported by the user's device and browser.")
 
     st.caption(f"Signed in as {email}")
     if st.button("Sign out"):
@@ -333,6 +427,7 @@ def access_gate(email: str) -> Dict:
             st.logout()
         st.stop()
 
+    record = sync_subscription_from_stripe(email, record)
     subscription_status = str(record.get("subscription_status") or "inactive").lower()
     if subscription_status in {"active", "trialing"}:
         return record
@@ -723,6 +818,7 @@ def render_stock_section(detail: Dict) -> None:
 # Main app
 # =============================================================================
 user_email = oidc_login_gate()
+confirm_checkout_return(user_email)
 access_record = access_gate(user_email)
 
 try:

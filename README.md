@@ -78,3 +78,26 @@ verified Google email and are included in **Current universe** on future visits.
 - `.gitignore`
 
 Do not deploy/commit a real `.streamlit/secrets.toml`.
+
+
+## 7. Stripe test subscription integration
+
+Configure Streamlit Secrets:
+
+```toml
+[stripe]
+secret_key = "sk_test_..."
+price_id = "price_..."
+app_url = "https://mojmarket.streamlit.app"
+```
+
+The app creates a Stripe-hosted Checkout Session for the authenticated user's email.
+After successful checkout, Stripe returns to the app with the Checkout Session ID.
+The app verifies that session server-side using the Stripe secret key, stores the
+customer/subscription identifiers and current subscription status in Supabase, and
+then grants access. On later visits, the app re-checks the Stripe subscription by ID
+and refreshes Supabase.
+
+This version does not require a public webhook endpoint for basic access control.
+A webhook can still be added later for real-time background updates when users are
+not actively visiting the app.
