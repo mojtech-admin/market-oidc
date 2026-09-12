@@ -363,6 +363,21 @@ def sync_subscription_from_stripe(email: str, record: Dict) -> Dict:
         return record
 
 
+
+
+def cancel_subscription_at_period_end(email: str, record: Dict) -> Dict:
+    """Schedule the current Stripe subscription to cancel at period end."""
+    sub_id = str(record.get("stripe_subscription_id") or "").strip()
+    if not sub_id:
+        raise RuntimeError("No Stripe subscription is associated with this account.")
+
+    stripe.api_key = _stripe_secret_key()
+    subscription = stripe.Subscription.modify(sub_id, cancel_at_period_end=True)
+    fields = _stripe_subscription_fields(subscription)
+    # Preserve active/trialing status while access continues through period end.
+    updated = _update_subscription_record(email, fields)
+    return {**record, **updated}
+
 def render_subscription_screen(email: str, record: Dict) -> None:
     st.title("🚦 Smart Market")
     st.markdown("## Continue your access")
@@ -414,7 +429,7 @@ def render_subscription_screen(email: str, record: Dict) -> None:
 
     if checkout_url:
         st.link_button(
-            "Subscribe — $49.99/month",
+            "Subscribe",
             checkout_url,
             type="primary",
             use_container_width=True,
@@ -477,9 +492,38 @@ def access_gate(email: str) -> Dict:
     return record
 
 
-def render_trial_status(record: Dict) -> None:
+def render_trial_status(record: Dict, email: str) -> None:
     if str(record.get("subscription_status") or "inactive").lower() in {"active", "trialing"}:
         st.success("Subscription active")
+
+        sub_id = str(record.get("stripe_subscription_id") or "").strip()
+        if sub_id:
+            confirm_key = "_confirm_subscription_cancel"
+            if not st.session_state.get(confirm_key, False):
+                if st.button("Cancel subscription", key="cancel_subscription_sidebar"):
+                    st.session_state[confirm_key] = True
+                    st.rerun()
+            else:
+                st.warning("Cancel at the end of the current billing period?")
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button("Yes, cancel", key="confirm_cancel_subscription"):
+                        try:
+                            updated = cancel_subscription_at_period_end(email, record)
+                            st.session_state[confirm_key] = False
+                            period_end = _parse_ts(updated.get("subscription_current_period_end"))
+                            if period_end:
+                                st.success(f"Cancellation scheduled. Access continues until {period_end.strftime('%b %d, %Y')}.")
+                            else:
+                                st.success("Cancellation scheduled for the end of the current billing period.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error("Could not cancel the subscription.")
+                            st.caption(str(exc))
+                with col2:
+                    if st.button("Keep subscription", key="keep_subscription"):
+                        st.session_state[confirm_key] = False
+                        st.rerun()
         return
 
     trial_end = _parse_ts(record.get("trial_ends_at"))
@@ -879,7 +923,7 @@ st.caption(
 
 with st.sidebar:
     st.caption(f"Signed in as {user_email}")
-    render_trial_status(access_record)
+    render_trial_status(access_record, user_email)
     if st.button("Sign out"):
         st.logout()
 

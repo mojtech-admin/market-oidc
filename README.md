@@ -104,3 +104,7 @@ not actively visiting the app.
 
 ## Stripe checkout UI v2
 The subscription CTA is capped at 620px on desktop and remains responsive/full-width on narrow/mobile screens. No payment-flow logic was changed.
+
+
+## Stripe checkout v4
+Subscribed users now have a Cancel subscription control in the sidebar. Cancellation is scheduled at the end of the current Stripe billing period so access continues through the paid period.
