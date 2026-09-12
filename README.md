@@ -101,3 +101,6 @@ and refreshes Supabase.
 This version does not require a public webhook endpoint for basic access control.
 A webhook can still be added later for real-time background updates when users are
 not actively visiting the app.
+
+## Stripe checkout UI v2
+The subscription CTA is capped at 620px on desktop and remains responsive/full-width on narrow/mobile screens. No payment-flow logic was changed.

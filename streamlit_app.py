@@ -380,14 +380,50 @@ def render_subscription_screen(email: str, record: Dict) -> None:
         unsafe_allow_html=True,
     )
 
-    if st.button("Subscribe — $49.99/month", type="primary", use_container_width=True):
+    # Keep the primary subscription CTA compact on desktop while remaining
+    # full-width on narrow/mobile screens.
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stButton"] button[kind="primary"] {
+            width: 100% !important;
+            max-width: 620px !important;
+        }
+        div[data-testid="stLinkButton"] a {
+            width: 100% !important;
+            max-width: 620px !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Prepare one Stripe Checkout Session before rendering the CTA so the
+    # subscription button is a direct link to Stripe (no intermediate
+    # Streamlit rerun/redirect page). Reuse it for the current browser
+    # session to avoid creating a new Checkout Session on every rerun.
+    checkout_url = st.session_state.get("_stripe_checkout_url")
+    checkout_error = None
+    if not checkout_url:
         try:
             session = create_checkout_session(email)
-            st.markdown(f'<meta http-equiv="refresh" content="0; url={session.url}">', unsafe_allow_html=True)
-            st.link_button("Continue to secure Stripe checkout", session.url, type="primary", use_container_width=True)
+            checkout_url = session.url
+            st.session_state["_stripe_checkout_url"] = checkout_url
         except Exception as exc:
-            st.error("Could not start Stripe checkout.")
-            st.caption(str(exc))
+            checkout_error = str(exc)
+
+    if checkout_url:
+        st.link_button(
+            "Subscribe — $49.99/month",
+            checkout_url,
+            type="primary",
+            use_container_width=True,
+        )
+    else:
+        st.error("Could not start Stripe checkout.")
+        if checkout_error:
+            st.caption(checkout_error)
+
     st.caption("Secure checkout is handled by Stripe. Card, Apple Pay, and Google Pay may appear when supported by the user's device and browser.")
 
     st.caption(f"Signed in as {email}")
