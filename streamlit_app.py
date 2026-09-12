@@ -641,20 +641,15 @@ def confirm_trial_payment_method_return(email: str) -> None:
 
 
 def render_trial_payment_method_screen(email: str, record: Dict) -> None:
-    """Require a verified, unused card before starting a new free trial."""
+    """Require payment-method verification before starting a new free trial."""
     st.title("🚦 Smart Market")
     st.markdown("## Start your 30-day free trial")
     st.write(
-        "To prevent repeated free-trial abuse, Smart Market verifies a payment method "
-        "before starting the trial."
-    )
-    st.success(
-        "**You will not be charged during the 30-day free trial.** "
-        "This step only verifies and securely stores your payment method with Stripe."
+        "Verify a payment method to confirm you are a real user. "
+        "You will not be charged during the 30-day free trial."
     )
     st.caption(
-        "Smart Market never receives or stores your full card number, expiration date, "
-        "or security code. Payment details are handled by Stripe."
+        "Payment details are handled securely by Stripe."
     )
 
     cached_email = st.session_state.get("_trial_setup_checkout_email")
@@ -676,7 +671,7 @@ def render_trial_payment_method_screen(email: str, record: Dict) -> None:
 
     if checkout_url:
         st.link_button(
-            "Verify payment method & start free trial",
+            "Verify payment method",
             checkout_url,
             type="primary",
             use_container_width=False,

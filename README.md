@@ -295,3 +295,14 @@ from_email = "Smart Market <onboarding@resend.dev>"
 
 For production email sending, verify a domain in Resend and replace `from_email`
 with an address on that verified domain.
+
+
+## v15 messaging refinement
+
+The new-user flow still performs email/name checks before payment-method verification.
+The pre-trial payment page now uses concise copy and no longer mentions "free-trial abuse."
+
+Current wording:
+- `Start your 30-day free trial`
+- `Verify a payment method to confirm you are a real user. You will not be charged during the 30-day free trial.`
+- `Payment details are handled securely by Stripe.`
