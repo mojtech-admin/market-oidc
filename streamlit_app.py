@@ -206,7 +206,7 @@ def get_user_access_record(email: str) -> Dict:
         "select": (
             "email,name,status,approved_at,trial_started_at,trial_ends_at,"
             "subscription_status,stripe_customer_id,stripe_subscription_id,"
-            "subscription_current_period_end"
+            "subscription_current_period_end,subscription_cancel_at_period_end"
         ),
         "limit": "1",
     }
@@ -286,6 +286,7 @@ def _stripe_subscription_fields(subscription) -> Dict:
         "stripe_subscription_id": str(getattr(subscription, "id", "") or ""),
         "stripe_customer_id": str(getattr(subscription, "customer", "") or ""),
         "subscription_current_period_end": current_period_end,
+        "subscription_cancel_at_period_end": bool(getattr(subscription, "cancel_at_period_end", False)),
     }
 
 
@@ -374,7 +375,19 @@ def cancel_subscription_at_period_end(email: str, record: Dict) -> Dict:
     stripe.api_key = _stripe_secret_key()
     subscription = stripe.Subscription.modify(sub_id, cancel_at_period_end=True)
     fields = _stripe_subscription_fields(subscription)
-    # Preserve active/trialing status while access continues through period end.
+    updated = _update_subscription_record(email, fields)
+    return {**record, **updated}
+
+
+def resume_subscription(email: str, record: Dict) -> Dict:
+    """Resume a subscription that is scheduled to cancel at period end."""
+    sub_id = str(record.get("stripe_subscription_id") or "").strip()
+    if not sub_id:
+        raise RuntimeError("No Stripe subscription is associated with this account.")
+
+    stripe.api_key = _stripe_secret_key()
+    subscription = stripe.Subscription.modify(sub_id, cancel_at_period_end=False)
+    fields = _stripe_subscription_fields(subscription)
     updated = _update_subscription_record(email, fields)
     return {**record, **updated}
 
@@ -493,9 +506,28 @@ def access_gate(email: str) -> Dict:
 
 
 def render_trial_status(record: Dict, email: str) -> None:
-    if str(record.get("subscription_status") or "inactive").lower() in {"active", "trialing"}:
-        st.success("Subscription active")
+    subscription_status = str(record.get("subscription_status") or "inactive").lower()
+    cancel_at_period_end = bool(record.get("subscription_cancel_at_period_end", False))
+    period_end = _parse_ts(record.get("subscription_current_period_end"))
 
+    if subscription_status in {"active", "trialing"}:
+        if cancel_at_period_end:
+            if period_end:
+                st.success(f"Subscription active until {period_end.strftime('%b %d, %Y')}")
+            else:
+                st.success("Subscription active until the end of the current billing period")
+
+            if st.button("Resume subscription", key="resume_subscription_sidebar"):
+                try:
+                    resume_subscription(email, record)
+                    st.success("Subscription resumed.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error("Could not resume the subscription.")
+                    st.caption(str(exc))
+            return
+
+        st.success("Subscription active")
         sub_id = str(record.get("stripe_subscription_id") or "").strip()
         if sub_id:
             confirm_key = "_confirm_subscription_cancel"
@@ -504,16 +536,28 @@ def render_trial_status(record: Dict, email: str) -> None:
                     st.session_state[confirm_key] = True
                     st.rerun()
             else:
-                st.warning("Cancel at the end of the current billing period?")
+                if period_end:
+                    st.warning(
+                        f"Cancel at the end of the current billing period on {period_end.strftime('%b %d, %Y')}?"
+                    )
+                    st.caption(
+                        f"You will continue to have full access until {period_end.strftime('%b %d, %Y')}."
+                    )
+                else:
+                    st.warning("Cancel at the end of the current billing period?")
+                    st.caption("You will continue to have full access through the current billing period.")
+
                 col1, col2 = st.columns(2)
                 with col1:
-                    if st.button("Yes, cancel", key="confirm_cancel_subscription"):
+                    if st.button("Confirm cancellation", key="confirm_cancel_subscription"):
                         try:
                             updated = cancel_subscription_at_period_end(email, record)
                             st.session_state[confirm_key] = False
-                            period_end = _parse_ts(updated.get("subscription_current_period_end"))
-                            if period_end:
-                                st.success(f"Cancellation scheduled. Access continues until {period_end.strftime('%b %d, %Y')}.")
+                            updated_period_end = _parse_ts(updated.get("subscription_current_period_end"))
+                            if updated_period_end:
+                                st.success(
+                                    f"Cancellation scheduled. Access continues until {updated_period_end.strftime('%b %d, %Y')}."
+                                )
                             else:
                                 st.success("Cancellation scheduled for the end of the current billing period.")
                             st.rerun()
@@ -521,7 +565,7 @@ def render_trial_status(record: Dict, email: str) -> None:
                             st.error("Could not cancel the subscription.")
                             st.caption(str(exc))
                 with col2:
-                    if st.button("Keep subscription", key="keep_subscription"):
+                    if st.button("Keep Subscription - $49.99/month", key="keep_subscription"):
                         st.session_state[confirm_key] = False
                         st.rerun()
         return
@@ -538,9 +582,14 @@ def render_trial_status(record: Dict, email: str) -> None:
 def render_membership_status(record: Dict) -> None:
     """Render compact membership status for the main page header."""
     subscription_status = str(record.get("subscription_status") or "inactive").lower()
+    cancel_at_period_end = bool(record.get("subscription_cancel_at_period_end", False))
+    period_end = _parse_ts(record.get("subscription_current_period_end"))
 
     if subscription_status in {"active", "trialing"}:
-        label = "Subscribed member"
+        if cancel_at_period_end and period_end:
+            label = f"Subscribed member until {period_end.strftime('%b %d, %Y')}"
+        else:
+            label = "Subscribed member"
     else:
         trial_end = _parse_ts(record.get("trial_ends_at"))
         now = datetime.now(timezone.utc)
