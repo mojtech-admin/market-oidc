@@ -167,3 +167,36 @@ Subscription object to each subscription item. v9 reads the billing-period end f
 Stripe API versions. This fix is applied both to the Streamlit Stripe sync and the
 Supabase `stripe-webhook` Edge Function. No new Supabase migration is required.
 
+
+
+## v10 — Fix Streamlit sync overwriting billing-period end
+
+v9 added the modern Stripe item-level billing-period helper, but one Streamlit
+mapping function still read the removed top-level `subscription.current_period_end`.
+That caused a correctly populated webhook value to be overwritten with NULL whenever
+the app synchronized the subscription from Stripe. v10 routes that mapping through
+the item-level helper as intended. No event-list changes, secret changes, or database
+migration are required.
+
+
+
+
+## v11 — pre-test reliability review
+
+v11 keeps the existing subscription state model and webhook event list, while
+hardening several implementation details before end-to-end testing:
+
+- billing-period lookup now prefers Stripe `cancel_at` for scheduled
+  cancellations, then item-level `current_period_end`, and can retrieve the
+  subscription item directly if Stripe returns a thin object;
+- the same defensive period lookup is used by the Supabase webhook;
+- Stripe Checkout reuses an existing Stripe customer when available instead
+  of creating unnecessary duplicate customers;
+- cached Checkout URLs are scoped to the signed-in email and cleared after a
+  successful checkout;
+- obsolete local signup-JSON code and generated Python cache files were
+  removed from the package.
+
+No new Supabase migration, Stripe event selection, or Streamlit secret is
+required for v11.
+

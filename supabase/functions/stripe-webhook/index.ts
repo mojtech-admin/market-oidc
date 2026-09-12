@@ -5,16 +5,35 @@ const stripe = new Stripe(Deno.env.get('STRIPE_SECRET_KEY') as string)
 const cryptoProvider = Stripe.createSubtleCryptoProvider()
 
 
-function getSubscriptionCurrentPeriodEnd(subscription: any): number | null {
+async function getSubscriptionCurrentPeriodEnd(subscription: any): Promise<number | null> {
+  // If Stripe has resolved a scheduled cancellation timestamp, prefer it for
+  // the user's access-until date.
+  if (subscription?.cancel_at_period_end && subscription?.cancel_at) {
+    return subscription.cancel_at
+  }
+
   // Stripe API versions from Basil onward expose current_period_end on
   // subscription items instead of the top-level Subscription object.
-  const itemPeriodEnd =
-    subscription?.items?.data?.[0]?.current_period_end ?? null;
+  const firstItem = subscription?.items?.data?.[0]
+  if (firstItem?.current_period_end) {
+    return firstItem.current_period_end
+  }
 
-  if (itemPeriodEnd) return itemPeriodEnd;
+  // Defensive fallback for thin webhook objects: retrieve the subscription
+  // item directly from Stripe.
+  if (firstItem?.id) {
+    try {
+      const item = await stripe.subscriptionItems.retrieve(firstItem.id)
+      if ((item as any)?.current_period_end) {
+        return (item as any).current_period_end
+      }
+    } catch (err) {
+      console.warn('Stripe webhook: could not retrieve subscription item period', err)
+    }
+  }
 
   // Backward-compatible fallback for older Stripe API versions.
-  return subscription?.current_period_end ?? null;
+  return subscription?.current_period_end ?? null
 }
 
 function isoFromUnix(value: number | null | undefined): string | null {
@@ -102,7 +121,9 @@ async function persistSubscription(
     subscription_status: subscription.status,
     stripe_subscription_id: subscription.id,
     stripe_customer_id: stringId(subscription.customer),
-    subscription_current_period_end: isoFromUnix(getSubscriptionCurrentPeriodEnd(subscription)),
+    subscription_current_period_end: isoFromUnix(
+      await getSubscriptionCurrentPeriodEnd(subscription),
+    ),
     subscription_cancel_at_period_end: Boolean(subscription.cancel_at_period_end),
   }
 

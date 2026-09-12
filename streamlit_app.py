@@ -4,9 +4,8 @@ import json
 import re
 import requests
 import stripe
-from pathlib import Path
 from datetime import datetime, timezone
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import pandas as pd
 import streamlit as st
@@ -24,7 +23,6 @@ st.set_page_config(
     layout="wide",
 )
 
-SIGNUPS_FILE = Path(__file__).with_name("traffic_light_signups.json")
 
 # Fixed universe. Custom symbols entered by a user are session-only and do not
 # modify this list.
@@ -278,14 +276,12 @@ def _app_base_url() -> str:
 
 def _stripe_subscription_fields(subscription) -> Dict:
     status = str(getattr(subscription, "status", "") or "inactive").lower()
-    current_period_end = getattr(subscription, "current_period_end", None)
-    if current_period_end:
-        current_period_end = datetime.fromtimestamp(int(current_period_end), tz=timezone.utc).isoformat()
+    period_end = _stripe_subscription_period_end(subscription)
     return {
         "subscription_status": status,
         "stripe_subscription_id": str(getattr(subscription, "id", "") or ""),
         "stripe_customer_id": str(getattr(subscription, "customer", "") or ""),
-        "subscription_current_period_end": current_period_end,
+        "subscription_current_period_end": period_end.isoformat() if period_end else None,
         "subscription_cancel_at_period_end": bool(getattr(subscription, "cancel_at_period_end", False)),
     }
 
@@ -303,20 +299,29 @@ def _update_subscription_record(email: str, fields: Dict) -> Dict:
     return rows[0] if rows else fields
 
 
-def create_checkout_session(email: str):
+def create_checkout_session(email: str, record: Dict):
+    """Create a Stripe Checkout Session, reusing the customer's Stripe ID when available."""
     stripe.api_key = _stripe_secret_key()
     base = _app_base_url()
-    return stripe.checkout.Session.create(
-        mode="subscription",
-        line_items=[{"price": _stripe_price_id(), "quantity": 1}],
-        customer_email=email,
-        client_reference_id=email,
-        success_url=f"{base}/?checkout=success&session_id={{CHECKOUT_SESSION_ID}}",
-        cancel_url=f"{base}/?checkout=cancelled",
-        allow_promotion_codes=False,
-        subscription_data={"metadata": {"user_email": email}},
-        metadata={"user_email": email},
-    )
+
+    kwargs = {
+        "mode": "subscription",
+        "line_items": [{"price": _stripe_price_id(), "quantity": 1}],
+        "client_reference_id": email,
+        "success_url": f"{base}/?checkout=success&session_id={{CHECKOUT_SESSION_ID}}",
+        "cancel_url": f"{base}/?checkout=cancelled",
+        "allow_promotion_codes": False,
+        "subscription_data": {"metadata": {"user_email": email}},
+        "metadata": {"user_email": email},
+    }
+
+    customer_id = str(record.get("stripe_customer_id") or "").strip()
+    if customer_id:
+        kwargs["customer"] = customer_id
+    else:
+        kwargs["customer_email"] = email
+
+    return stripe.checkout.Session.create(**kwargs)
 
 
 def confirm_checkout_return(email: str) -> None:
@@ -342,6 +347,8 @@ def confirm_checkout_return(email: str) -> None:
 
         fields = _stripe_subscription_fields(subscription)
         _update_subscription_record(email, fields)
+        st.session_state.pop("_stripe_checkout_url", None)
+        st.session_state.pop("_stripe_checkout_email", None)
         st.query_params.clear()
         st.success("Subscription activated. Welcome to Smart Market.")
         st.rerun()
@@ -352,24 +359,53 @@ def confirm_checkout_return(email: str) -> None:
 
 
 def _stripe_subscription_period_end(subscription) -> Optional[datetime]:
-    """Return the current billing-period end using modern Stripe item-level fields.
+    """Return the authoritative current billing-period end.
 
-    Stripe API versions from Basil onward moved current_period_end from the
-    top-level Subscription object to subscription items. Fall back to the
-    legacy top-level field for compatibility with older API versions.
+    Modern Stripe API versions keep period dates on subscription items. For a
+    cancellation scheduled at period end, use Stripe's resolved cancel_at
+    timestamp when present. If a returned subscription item is thin and lacks
+    current_period_end, retrieve that subscription item directly.
     """
     ts = None
+
+    # When Stripe has resolved the scheduled cancellation timestamp, this is
+    # the most direct value for the access-until date.
     try:
-        items = getattr(subscription, "items", None)
-        data = getattr(items, "data", None) if items is not None else None
-        if data:
-            first = data[0]
-            ts = getattr(first, "current_period_end", None)
-            if ts is None and isinstance(first, dict):
-                ts = first.get("current_period_end")
+        if bool(getattr(subscription, "cancel_at_period_end", False)):
+            ts = getattr(subscription, "cancel_at", None)
     except Exception:
         ts = None
+    if ts is None and isinstance(subscription, dict):
+        if bool(subscription.get("cancel_at_period_end")):
+            ts = subscription.get("cancel_at")
 
+    item_id = None
+    if ts is None:
+        try:
+            items = getattr(subscription, "items", None)
+            data = getattr(items, "data", None) if items is not None else None
+            if data:
+                first = data[0]
+                ts = getattr(first, "current_period_end", None)
+                item_id = getattr(first, "id", None)
+                if isinstance(first, dict):
+                    ts = ts or first.get("current_period_end")
+                    item_id = item_id or first.get("id")
+        except Exception:
+            ts = None
+
+    # Defensive fallback: explicitly retrieve the single Smart Market
+    # subscription item if Stripe did not include its period end inline.
+    if ts is None and item_id:
+        try:
+            item = stripe.SubscriptionItem.retrieve(str(item_id))
+            ts = getattr(item, "current_period_end", None)
+            if ts is None and isinstance(item, dict):
+                ts = item.get("current_period_end")
+        except Exception:
+            ts = None
+
+    # Legacy fallback for pre-Basil Stripe API versions.
     if ts is None:
         try:
             ts = getattr(subscription, "current_period_end", None)
@@ -379,7 +415,6 @@ def _stripe_subscription_period_end(subscription) -> Optional[datetime]:
         ts = subscription.get("current_period_end")
 
     return datetime.fromtimestamp(int(ts), tz=timezone.utc) if ts else None
-
 
 def sync_subscription_from_stripe(email: str, record: Dict) -> Dict:
     sub_id = str(record.get("stripe_subscription_id") or "").strip()
@@ -521,13 +556,19 @@ def render_subscription_screen(email: str, record: Dict) -> None:
     # subscription button is a direct link to Stripe (no intermediate
     # Streamlit rerun/redirect page). Reuse it for the current browser
     # session to avoid creating a new Checkout Session on every rerun.
-    checkout_url = st.session_state.get("_stripe_checkout_url")
+    cached_email = st.session_state.get("_stripe_checkout_email")
+    checkout_url = (
+        st.session_state.get("_stripe_checkout_url")
+        if cached_email == email
+        else None
+    )
     checkout_error = None
     if not checkout_url:
         try:
-            session = create_checkout_session(email)
+            session = create_checkout_session(email, record)
             checkout_url = session.url
             st.session_state["_stripe_checkout_url"] = checkout_url
+            st.session_state["_stripe_checkout_email"] = email
         except Exception as exc:
             checkout_error = str(exc)
 
