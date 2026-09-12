@@ -200,3 +200,98 @@ hardening several implementation details before end-to-end testing:
 No new Supabase migration, Stripe event selection, or Streamlit secret is
 required for v11.
 
+
+
+## v12 — Stripe card fingerprint metadata
+
+v12 adds server-side capture of Stripe PaymentMethod card metadata:
+- `stripe_payment_method_id`
+- `card_fingerprint`
+- `card_brand`
+- `card_last4`
+- `card_fingerprint_reused`
+
+The raw card number, expiration date, and CVC never enter Smart Market or Supabase.
+
+Run `supabase_card_fingerprint_migration_v1.sql` once before deploying v12.
+
+Important: Smart Market's current trial starts before a payment method is collected.
+Therefore fingerprint reuse can be detected after Stripe Checkout, but it cannot yet
+prevent a second Gmail account from consuming a new free trial. To enforce one free
+trial per card, move payment-method collection to the beginning of the trial flow.
+
+
+## v13 — payment-method-gated 30-day free trial
+
+New-user access flow:
+
+1. Google sign-in
+2. Administrator approval
+3. Stripe-hosted payment-method verification (`mode="setup"`)
+4. Stripe card fingerprint check
+5. If the fingerprint has not previously received a Smart Market trial:
+   - start the 30-day trial
+   - do not charge the card
+6. If the fingerprint has previously received a trial:
+   - do not start another trial
+   - offer the normal paid subscription
+
+The pre-trial screen explicitly tells the user:
+
+> You will not be charged during the 30-day free trial.
+
+The card is collected by Stripe. Smart Market never receives or stores the full card
+number, expiration date, or CVC.
+
+### Required deployment steps
+
+1. Run `supabase_trial_payment_gate_migration_v1.sql` once.
+2. Deploy the v13 Streamlit files.
+3. Replace/redeploy `supabase/functions/stripe-webhook/index.ts`.
+4. Keep the existing Stripe webhook event list; `checkout.session.completed` now
+   handles both subscription Checkout and payment-method setup Checkout.
+
+Existing users with already-populated trial dates or active subscriptions retain
+their current access state.
+
+
+## v14 — automated signup review + repeat-trial controls
+
+New signup behavior:
+
+- The existing `status` field remains unchanged: `pending`, `approved`, or `denied`.
+- Same Google email always maps to the existing `app_users` row, so the same email
+  cannot create another trial.
+- Low-risk new users are automatically created as `approved`.
+- A duplicate normalized Google profile name is flagged for manual review.
+- An unusually dense signup burst (5 or more prior requests in 10 minutes) is also
+  flagged for review.
+- Flagged users remain `pending` with:
+  - `review_required = true`
+  - `review_reason = ...`
+- If Resend alerts are configured, the administrator receives an email immediately.
+- After manual approval, the existing v13 Stripe payment-method gate runs:
+  - unused card fingerprint -> 30-day free trial
+  - previously used trial card -> no second free trial, offer paid subscription
+
+### Required deployment
+
+1. Run `supabase_signup_risk_migration_v1.sql` once.
+2. Add `[alerts]` secrets in Streamlit if email notifications are desired.
+3. Deploy the v14 Streamlit files.
+4. No new Stripe webhook events are required.
+5. No Supabase Edge Function code change is required specifically for v14.
+
+### Email alerts with Resend
+
+Add to Streamlit Secrets:
+
+```toml
+[alerts]
+resend_api_key = "re_..."
+admin_email = "YOUR_ADMIN_EMAIL"
+from_email = "Smart Market <onboarding@resend.dev>"
+```
+
+For production email sending, verify a domain in Resend and replace `from_email`
+with an address on that verified domain.

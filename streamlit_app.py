@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import unicodedata
 import re
 import requests
 import stripe
@@ -197,14 +198,145 @@ def _parse_ts(value):
         return None
 
 
+
+def _normalize_signup_name(name: str) -> str:
+    """Normalize a Google profile name for duplicate-name review checks."""
+    text = unicodedata.normalize("NFKD", str(name or ""))
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _alert_secret(name: str, default: str = "") -> str:
+    try:
+        value = st.secrets["alerts"][name]
+        return str(value or "").strip()
+    except Exception:
+        return default
+
+
+def _send_signup_review_email(email: str, name: str, reasons: List[str]) -> tuple[bool, str]:
+    """Send a review alert through Resend. Failure never blocks signup state persistence."""
+    api_key = _alert_secret("resend_api_key")
+    admin_email = _alert_secret("admin_email")
+    from_email = _alert_secret("from_email", "Smart Market <onboarding@resend.dev>")
+
+    if not api_key or not admin_email:
+        return False, "Email alerts are not configured."
+
+    reason_lines = "\n".join(f"- {reason}" for reason in reasons)
+    subject = "Smart Market signup requires review"
+    body = (
+        "A new Smart Market signup was flagged for manual review.\n\n"
+        f"Email: {email}\n"
+        f"Name: {name or '(not provided)'}\n"
+        "Reason(s):\n"
+        f"{reason_lines}\n\n"
+        "Open Supabase -> app_users and review this account. "
+        "If acceptable, change status from pending to approved."
+    )
+
+    try:
+        r = requests.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "from": from_email,
+                "to": [admin_email],
+                "subject": subject,
+                "text": body,
+            },
+            timeout=15,
+        )
+        r.raise_for_status()
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _signup_risk_assessment(email: str, normalized_name: str) -> tuple[bool, List[str]]:
+    """Return whether a new signup needs manual review and the review reasons.
+
+    Current automated review signals:
+    - same normalized Google profile name as an existing account;
+    - unusually dense signup burst (5+ prior signup requests in 10 minutes).
+
+    Same email is handled separately by the email primary key and can never create
+    a second user/trial row.
+    """
+    reasons: List[str] = []
+
+    if normalized_name:
+        r = requests.get(
+            supabase_url("app_users"),
+            headers=supabase_headers(),
+            params={
+                "select": "email",
+                "normalized_name": f"eq.{normalized_name}",
+                "email": f"neq.{email}",
+                "limit": "1",
+            },
+            timeout=15,
+        )
+        r.raise_for_status()
+        if r.json():
+            reasons.append("Duplicate normalized profile name")
+
+    # High-threshold velocity signal. This is intentionally not a low threshold
+    # because a legitimate publicity spike can create several signups at once.
+    from datetime import timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    r = requests.get(
+        supabase_url("app_users"),
+        headers=supabase_headers(),
+        params={
+            "select": "email,requested_at",
+            "requested_at": f"gte.{cutoff}",
+            "limit": "10",
+        },
+        timeout=15,
+    )
+    r.raise_for_status()
+    recent = r.json()
+    if len(recent) >= 5:
+        reasons.append("Unusually high signup volume in the last 10 minutes")
+
+    return bool(reasons), reasons
+
+
+def _mark_review_notification(email: str, sent: bool, error: str = "") -> None:
+    payload = {
+        "review_notified_at": datetime.now(timezone.utc).isoformat() if sent else None,
+        "review_notification_error": None if sent else (error or None),
+    }
+    try:
+        requests.patch(
+            supabase_url("app_users"),
+            headers=supabase_headers(),
+            params={"email": f"eq.{email}"},
+            json=payload,
+            timeout=15,
+        )
+    except Exception:
+        pass
+
+
 def get_user_access_record(email: str) -> Dict:
-    """Return the user's access record, creating a pending record if needed."""
+    """Return the user's access record, creating and risk-classifying it if needed."""
     params = {
         "email": f"eq.{email}",
         "select": (
             "email,name,status,approved_at,trial_started_at,trial_ends_at,"
             "subscription_status,stripe_customer_id,stripe_subscription_id,"
-            "subscription_current_period_end,subscription_cancel_at_period_end"
+            "subscription_current_period_end,subscription_cancel_at_period_end,"
+            "stripe_payment_method_id,card_fingerprint,card_brand,card_last4,"
+            "card_fingerprint_reused,trial_eligibility_status,"
+            "review_required,review_reason,normalized_name,review_notified_at,"
+            "review_notification_error,requested_at"
         ),
         "limit": "1",
     }
@@ -218,10 +350,26 @@ def get_user_access_record(email: str) -> Dict:
     rows = r.json()
 
     if rows:
+        # Same Google email always resolves to the same database row, so it can
+        # never obtain a second trial merely by signing in again.
         return rows[0]
 
-    name = str(getattr(st.user, "name", "") or "")
-    payload = {"email": email, "name": name, "status": "pending"}
+    name = str(getattr(st.user, "name", "") or "").strip()
+    normalized_name = _normalize_signup_name(name)
+    review_required, reasons = _signup_risk_assessment(email, normalized_name)
+
+    # Low-risk users are approved automatically. Flagged users remain pending
+    # until the administrator manually reviews them.
+    status = "pending" if review_required else "approved"
+    payload = {
+        "email": email,
+        "name": name,
+        "normalized_name": normalized_name or None,
+        "status": status,
+        "review_required": review_required,
+        "review_reason": "; ".join(reasons) if reasons else None,
+    }
+
     r = requests.post(
         supabase_url("app_users"),
         headers={**supabase_headers(), "Prefer": "return=representation"},
@@ -230,32 +378,27 @@ def get_user_access_record(email: str) -> Dict:
     )
     r.raise_for_status()
     created = r.json()
-    return created[0] if created else payload
+    record = created[0] if created else payload
+
+    if review_required:
+        sent, error = _send_signup_review_email(email, name, reasons)
+        _mark_review_notification(email, sent, error)
+        record["review_notified_at"] = (
+            datetime.now(timezone.utc).isoformat() if sent else None
+        )
+        record["review_notification_error"] = None if sent else error
+
+    return record
 
 
 def _initialize_trial_if_missing(record: Dict) -> Dict:
-    """Safety fallback for approved users created before the trial migration."""
-    if record.get("status") != "approved" or record.get("trial_ends_at"):
-        return record
+    """Compatibility helper.
 
-    now = datetime.now(timezone.utc)
-    from datetime import timedelta
-    trial_end = now + timedelta(days=30)
-    payload = {
-        "approved_at": record.get("approved_at") or now.isoformat(),
-        "trial_started_at": record.get("trial_started_at") or now.isoformat(),
-        "trial_ends_at": trial_end.isoformat(),
-    }
-    r = requests.patch(
-        supabase_url("app_users"),
-        headers={**supabase_headers(), "Prefer": "return=representation"},
-        params={"email": f"eq.{record['email']}"},
-        json=payload,
-        timeout=15,
-    )
-    r.raise_for_status()
-    rows = r.json()
-    return rows[0] if rows else {**record, **payload}
+    New approved users do NOT receive trial dates until Stripe has collected a
+    payment method and the card fingerprint has passed the one-trial check.
+    Existing users keep any trial dates already stored in Supabase.
+    """
+    return record
 
 
 def _stripe_secret_key() -> str:
@@ -297,6 +440,256 @@ def _update_subscription_record(email: str, fields: Dict) -> Dict:
     r.raise_for_status()
     rows = r.json()
     return rows[0] if rows else fields
+
+
+
+def _find_reused_card_fingerprint(email: str, fingerprint: str) -> bool:
+    """Return True when another user already received a trial with this card fingerprint."""
+    if not fingerprint:
+        return False
+    r = requests.get(
+        supabase_url("app_users"),
+        headers=supabase_headers(),
+        params={
+            "select": "email",
+            "card_fingerprint": f"eq.{fingerprint}",
+            "email": f"neq.{email}",
+            "trial_started_at": "not.is.null",
+            "limit": "1",
+        },
+        timeout=15,
+    )
+    r.raise_for_status()
+    return bool(r.json())
+
+
+def _stripe_payment_method_fields(customer_id: str, email: str) -> Dict:
+    """Capture Stripe card metadata without ever handling raw card numbers."""
+    if not customer_id:
+        return {}
+
+    stripe.api_key = _stripe_secret_key()
+    payment_method = None
+
+    # Prefer the Customer's configured default payment method.
+    try:
+        customer = stripe.Customer.retrieve(customer_id)
+        invoice_settings = getattr(customer, "invoice_settings", None)
+        default_pm = getattr(invoice_settings, "default_payment_method", None) if invoice_settings else None
+        if default_pm:
+            payment_method = stripe.PaymentMethod.retrieve(str(default_pm))
+    except Exception:
+        payment_method = None
+
+    # Subscription-mode Checkout saves the payment method to the Customer.
+    # If no explicit default is configured, use the most recently attached card.
+    if payment_method is None:
+        methods = stripe.PaymentMethod.list(
+            customer=customer_id,
+            type="card",
+            limit=10,
+        )
+        data = list(getattr(methods, "data", []) or [])
+        if data:
+            data.sort(key=lambda pm: int(getattr(pm, "created", 0) or 0), reverse=True)
+            payment_method = data[0]
+
+    if payment_method is None:
+        return {}
+
+    card = getattr(payment_method, "card", None)
+    if card is None:
+        return {}
+
+    fingerprint = str(getattr(card, "fingerprint", "") or "").strip()
+    fields = {
+        "stripe_payment_method_id": str(getattr(payment_method, "id", "") or ""),
+        "card_fingerprint": fingerprint or None,
+        "card_brand": str(getattr(card, "brand", "") or "") or None,
+        "card_last4": str(getattr(card, "last4", "") or "") or None,
+        "card_fingerprint_reused": _find_reused_card_fingerprint(email, fingerprint)
+        if fingerprint
+        else False,
+    }
+    return fields
+
+
+
+def create_trial_payment_method_session(email: str, record: Dict):
+    """Collect a payment method without charging the customer."""
+    stripe.api_key = _stripe_secret_key()
+    base = _app_base_url()
+
+    kwargs = {
+        "mode": "setup",
+        "client_reference_id": email,
+        "success_url": f"{base}/?trial_setup=success&session_id={{CHECKOUT_SESSION_ID}}",
+        "cancel_url": f"{base}/?trial_setup=cancelled",
+        "payment_method_types": ["card"],
+        "metadata": {"user_email": email, "purpose": "trial_eligibility"},
+    }
+
+    customer_id = str(record.get("stripe_customer_id") or "").strip()
+    if customer_id:
+        kwargs["customer"] = customer_id
+    else:
+        kwargs["customer_email"] = email
+
+    return stripe.checkout.Session.create(**kwargs)
+
+
+def _payment_method_fields_from_id(payment_method_id: str, email: str) -> Dict:
+    """Read non-sensitive Stripe card metadata from a PaymentMethod ID."""
+    if not payment_method_id:
+        return {}
+
+    stripe.api_key = _stripe_secret_key()
+    payment_method = stripe.PaymentMethod.retrieve(payment_method_id)
+    card = getattr(payment_method, "card", None)
+    if card is None:
+        raise RuntimeError("The selected payment method is not a supported card.")
+
+    fingerprint = str(getattr(card, "fingerprint", "") or "").strip()
+    return {
+        "stripe_payment_method_id": str(getattr(payment_method, "id", "") or ""),
+        "card_fingerprint": fingerprint or None,
+        "card_brand": str(getattr(card, "brand", "") or "") or None,
+        "card_last4": str(getattr(card, "last4", "") or "") or None,
+        "card_fingerprint_reused": _find_reused_card_fingerprint(email, fingerprint)
+        if fingerprint
+        else False,
+    }
+
+
+def confirm_trial_payment_method_return(email: str) -> None:
+    """Finalize the pre-trial card check after Stripe Checkout returns."""
+    params = st.query_params
+    if params.get("trial_setup") != "success":
+        return
+
+    session_id = params.get("session_id")
+    if not session_id:
+        return
+
+    try:
+        stripe.api_key = _stripe_secret_key()
+        session = stripe.checkout.Session.retrieve(
+            session_id,
+            expand=["setup_intent.payment_method"],
+        )
+
+        session_email = str(
+            getattr(session, "client_reference_id", "") or ""
+        ).strip().lower()
+        if session_email != email:
+            raise RuntimeError("Trial setup session does not belong to the signed-in user.")
+
+        customer_id = str(getattr(session, "customer", "") or "")
+        setup_intent = getattr(session, "setup_intent", None)
+        payment_method = getattr(setup_intent, "payment_method", None) if setup_intent else None
+        payment_method_id = str(getattr(payment_method, "id", payment_method) or "")
+        if not payment_method_id:
+            raise RuntimeError("Stripe did not return a payment method.")
+
+        fields = _payment_method_fields_from_id(payment_method_id, email)
+        fields["stripe_customer_id"] = customer_id or None
+
+        reused = bool(fields.get("card_fingerprint_reused"))
+        if reused:
+            # The payment method is valid, but this card has already received a
+            # Smart Market free trial on another account. Do not grant another trial.
+            fields.update(
+                {
+                    "trial_started_at": None,
+                    "trial_ends_at": None,
+                    "trial_eligibility_status": "reused_card",
+                }
+            )
+            _update_subscription_record(email, fields)
+            st.session_state.pop("_trial_setup_checkout_url", None)
+            st.session_state.pop("_trial_setup_checkout_email", None)
+            st.query_params.clear()
+            st.warning(
+                "This payment method has already been used for a Smart Market free trial. "
+                "You can continue with a paid subscription."
+            )
+            st.rerun()
+
+        from datetime import timedelta
+        now = datetime.now(timezone.utc)
+        trial_end = now + timedelta(days=30)
+        fields.update(
+            {
+                "trial_started_at": now.isoformat(),
+                "trial_ends_at": trial_end.isoformat(),
+                "trial_eligibility_status": "eligible",
+            }
+        )
+        _update_subscription_record(email, fields)
+        st.session_state.pop("_trial_setup_checkout_url", None)
+        st.session_state.pop("_trial_setup_checkout_email", None)
+        st.query_params.clear()
+        st.success(
+            f"Your 30-day free trial is active through {trial_end.strftime('%b %d, %Y')}. "
+            "Your card will not be charged during the free trial."
+        )
+        st.rerun()
+
+    except Exception as exc:
+        st.error("We could not verify your payment method for the free trial.")
+        st.caption(str(exc))
+
+
+def render_trial_payment_method_screen(email: str, record: Dict) -> None:
+    """Require a verified, unused card before starting a new free trial."""
+    st.title("🚦 Smart Market")
+    st.markdown("## Start your 30-day free trial")
+    st.write(
+        "To prevent repeated free-trial abuse, Smart Market verifies a payment method "
+        "before starting the trial."
+    )
+    st.success(
+        "**You will not be charged during the 30-day free trial.** "
+        "This step only verifies and securely stores your payment method with Stripe."
+    )
+    st.caption(
+        "Smart Market never receives or stores your full card number, expiration date, "
+        "or security code. Payment details are handled by Stripe."
+    )
+
+    cached_email = st.session_state.get("_trial_setup_checkout_email")
+    checkout_url = (
+        st.session_state.get("_trial_setup_checkout_url")
+        if cached_email == email
+        else None
+    )
+    checkout_error = None
+
+    if not checkout_url:
+        try:
+            session = create_trial_payment_method_session(email, record)
+            checkout_url = session.url
+            st.session_state["_trial_setup_checkout_url"] = checkout_url
+            st.session_state["_trial_setup_checkout_email"] = email
+        except Exception as exc:
+            checkout_error = str(exc)
+
+    if checkout_url:
+        st.link_button(
+            "Verify payment method & start free trial",
+            checkout_url,
+            type="primary",
+            use_container_width=False,
+        )
+    else:
+        st.error("Could not open secure payment-method verification.")
+        if checkout_error:
+            st.caption(checkout_error)
+
+    st.caption(f"Signed in as {email}")
+    if st.button("Sign out", key="trial_setup_signout"):
+        st.logout()
+    st.stop()
 
 
 def create_checkout_session(email: str, record: Dict):
@@ -346,6 +739,8 @@ def confirm_checkout_return(email: str) -> None:
             raise RuntimeError("Stripe did not return a subscription for this checkout session.")
 
         fields = _stripe_subscription_fields(subscription)
+        customer_id = str(fields.get("stripe_customer_id") or "")
+        fields.update(_stripe_payment_method_fields(customer_id, email))
         _update_subscription_record(email, fields)
         st.session_state.pop("_stripe_checkout_url", None)
         st.session_state.pop("_stripe_checkout_email", None)
@@ -520,7 +915,13 @@ def render_payment_recovery_screen(email: str, record: Dict) -> None:
 def render_subscription_screen(email: str, record: Dict) -> None:
     st.title("🚦 Smart Market")
     st.markdown("## Continue your access")
-    st.write("Your 30-day introductory access period has ended.")
+    if str(record.get("trial_eligibility_status") or "") == "reused_card":
+        st.write(
+            "This payment method has already received a Smart Market free trial. "
+            "A new free trial is not available for this account."
+        )
+    else:
+        st.write("Your 30-day introductory access period has ended.")
 
     st.markdown(
         """
@@ -593,7 +994,7 @@ def render_subscription_screen(email: str, record: Dict) -> None:
 
 
 def access_gate(email: str) -> Dict:
-    """Enforce admin approval, trial access, subscription access, and billing recovery."""
+    """Enforce approval, card-gated trial eligibility, and paid subscription access."""
     try:
         record = get_user_access_record(email)
         record = _initialize_trial_if_missing(record)
@@ -613,9 +1014,18 @@ def access_gate(email: str) -> Dict:
 
     if status != "approved":
         st.title("🚦 Smart Market")
-        st.warning(
-            "Your Google account is verified, but access is awaiting administrator approval."
-        )
+        if bool(record.get("review_required")):
+            st.warning(
+                "Your account requires a brief administrator review before access can continue."
+            )
+            st.caption(
+                "You do not need to create another account. You will be able to continue "
+                "with this same Google account after approval."
+            )
+        else:
+            st.warning(
+                "Your Google account is verified, but access is awaiting administrator approval."
+            )
         st.write(f"Signed in as **{email}**")
         if st.button("Check access again"):
             st.rerun()
@@ -623,25 +1033,33 @@ def access_gate(email: str) -> Dict:
             st.logout()
         st.stop()
 
-    # Stripe is the source of truth whenever a subscription already exists.
+    # Stripe is authoritative whenever a paid subscription already exists.
     record = sync_subscription_from_stripe(email, record)
     subscription_status = str(record.get("subscription_status") or "inactive").lower()
 
     if subscription_status in {"active", "trialing"}:
         return record
 
-    # Existing subscriptions with a collection/payment problem go to billing
-    # recovery rather than the dashboard or a second Checkout subscription.
     if subscription_status in {"past_due", "unpaid", "incomplete", "paused"}:
         render_payment_recovery_screen(email, record)
 
-    # Canceled / incomplete_expired / inactive users can still use any
-    # unexpired introductory trial; otherwise they see the normal Subscribe flow.
     trial_ends_at = _parse_ts(record.get("trial_ends_at"))
     now = datetime.now(timezone.utc)
+
+    # Existing valid trial remains accessible.
     if trial_ends_at and now < trial_ends_at:
         return record
 
+    # A reused card is never granted another introductory trial.
+    if str(record.get("trial_eligibility_status") or "") == "reused_card":
+        render_subscription_screen(email, record)
+
+    # Approved users who have never started a trial must verify a payment
+    # method first. Stripe collects it without charging the card.
+    if not record.get("trial_started_at"):
+        render_trial_payment_method_screen(email, record)
+
+    # Trial existed but has now ended.
     render_subscription_screen(email, record)
     return record
 
@@ -1088,6 +1506,7 @@ def render_stock_section(detail: Dict) -> None:
 # Main app
 # =============================================================================
 user_email = oidc_login_gate()
+confirm_trial_payment_method_return(user_email)
 confirm_checkout_return(user_email)
 access_record = access_gate(user_email)
 

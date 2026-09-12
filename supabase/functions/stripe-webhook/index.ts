@@ -103,6 +103,159 @@ async function findEmailForSubscription(
   return ''
 }
 
+
+async function findCardFingerprintReuse(
+  email: string,
+  fingerprint: string,
+  supabaseAdmin: any,
+): Promise<boolean> {
+  if (!fingerprint) return false
+
+  const { data, error } = await supabaseAdmin
+    .from('app_users')
+    .select('email')
+    .eq('card_fingerprint', fingerprint)
+    .neq('email', email)
+    .limit(1)
+
+  if (error) throw error
+  return Boolean(data?.length)
+}
+
+async function paymentMethodFieldsForCustomer(
+  customerId: string,
+  email: string,
+  supabaseAdmin: any,
+): Promise<Record<string, unknown>> {
+  if (!customerId) return {}
+
+  let paymentMethod: Stripe.PaymentMethod | null = null
+
+  try {
+    const customer = await stripe.customers.retrieve(customerId)
+    if (!('deleted' in customer) || !customer.deleted) {
+      const defaultPm = stringId(customer.invoice_settings?.default_payment_method)
+      if (defaultPm) {
+        paymentMethod = await stripe.paymentMethods.retrieve(defaultPm)
+      }
+    }
+  } catch (_) {
+    paymentMethod = null
+  }
+
+  if (!paymentMethod) {
+    const methods = await stripe.paymentMethods.list({
+      customer: customerId,
+      type: 'card',
+      limit: 10,
+    })
+    const sorted = [...methods.data].sort(
+      (a, b) => Number(b.created ?? 0) - Number(a.created ?? 0),
+    )
+    paymentMethod = sorted[0] ?? null
+  }
+
+  if (!paymentMethod?.card) return {}
+
+  const fingerprint = String(paymentMethod.card.fingerprint ?? '').trim()
+
+  return {
+    stripe_payment_method_id: paymentMethod.id,
+    card_fingerprint: fingerprint || null,
+    card_brand: paymentMethod.card.brand ?? null,
+    card_last4: paymentMethod.card.last4 ?? null,
+    card_fingerprint_reused: fingerprint
+      ? await findCardFingerprintReuse(email, fingerprint, supabaseAdmin)
+      : false,
+  }
+}
+
+
+async function paymentMethodFieldsFromId(
+  paymentMethodId: string,
+  email: string,
+  supabaseAdmin: any,
+): Promise<Record<string, unknown>> {
+  if (!paymentMethodId) return {}
+
+  const paymentMethod = await stripe.paymentMethods.retrieve(paymentMethodId)
+  if (!paymentMethod.card) {
+    throw new Error('Trial payment method is not a supported card')
+  }
+
+  const fingerprint = String(paymentMethod.card.fingerprint ?? '').trim()
+
+  const { data, error } = await supabaseAdmin
+    .from('app_users')
+    .select('email')
+    .eq('card_fingerprint', fingerprint)
+    .neq('email', email)
+    .not('trial_started_at', 'is', null)
+    .limit(1)
+
+  if (error) throw error
+  const reused = Boolean(data?.length)
+
+  return {
+    stripe_payment_method_id: paymentMethod.id,
+    card_fingerprint: fingerprint || null,
+    card_brand: paymentMethod.card.brand ?? null,
+    card_last4: paymentMethod.card.last4 ?? null,
+    card_fingerprint_reused: reused,
+  }
+}
+
+async function processTrialSetupSession(
+  session: Stripe.Checkout.Session,
+  supabaseAdmin: any,
+) {
+  const email = String(
+    session.client_reference_id ||
+    session.metadata?.user_email ||
+    session.customer_details?.email ||
+    '',
+  ).trim().toLowerCase()
+
+  if (!email) return
+
+  const setupIntentId = stringId(session.setup_intent)
+  if (!setupIntentId) return
+
+  const setupIntent = await stripe.setupIntents.retrieve(setupIntentId)
+  const paymentMethodId = stringId(setupIntent.payment_method)
+  if (!paymentMethodId) return
+
+  const fields = await paymentMethodFieldsFromId(
+    paymentMethodId,
+    email,
+    supabaseAdmin,
+  )
+  const reused = Boolean(fields.card_fingerprint_reused)
+
+  const payload: Record<string, unknown> = {
+    ...fields,
+    stripe_customer_id: stringId(session.customer) || null,
+    trial_eligibility_status: reused ? 'reused_card' : 'eligible',
+  }
+
+  if (!reused) {
+    const now = new Date()
+    const trialEnd = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000)
+    payload.trial_started_at = now.toISOString()
+    payload.trial_ends_at = trialEnd.toISOString()
+  } else {
+    payload.trial_started_at = null
+    payload.trial_ends_at = null
+  }
+
+  const { error } = await supabaseAdmin
+    .from('app_users')
+    .update(payload)
+    .eq('email', email)
+
+  if (error) throw error
+}
+
 async function persistSubscription(
   subscription: Stripe.Subscription,
   supabaseAdmin: any,
@@ -117,14 +270,22 @@ async function persistSubscription(
     return
   }
 
+  const customerId = stringId(subscription.customer)
+  const paymentFields = await paymentMethodFieldsForCustomer(
+    customerId,
+    email,
+    supabaseAdmin,
+  )
+
   const payload = {
     subscription_status: subscription.status,
     stripe_subscription_id: subscription.id,
-    stripe_customer_id: stringId(subscription.customer),
+    stripe_customer_id: customerId,
     subscription_current_period_end: isoFromUnix(
       await getSubscriptionCurrentPeriodEnd(subscription),
     ),
     subscription_cancel_at_period_end: Boolean(subscription.cancel_at_period_end),
+    ...paymentFields,
   }
 
   const { error } = await supabaseAdmin
@@ -172,6 +333,11 @@ export default {
       switch (event.type) {
         case 'checkout.session.completed': {
           const session = event.data.object as Stripe.Checkout.Session
+          if (session.mode === 'setup') {
+            await processTrialSetupSession(session, ctx.supabaseAdmin)
+            break
+          }
+
           const email = String(
             session.client_reference_id ||
             session.metadata?.user_email ||
