@@ -198,6 +198,40 @@ def _parse_ts(value):
         return None
 
 
+def _business_days_remaining(now: datetime, end: datetime) -> int:
+    """Count business days after today through the trial end date."""
+    current = now.date()
+    end_date = end.date()
+    if current >= end_date:
+        return 0
+
+    days = 0
+    cursor = current
+    while cursor < end_date:
+        cursor = cursor.fromordinal(cursor.toordinal() + 1)
+        if cursor.weekday() < 5:
+            days += 1
+    return days
+
+
+def _trial_urgency(trial_end: datetime) -> str:
+    """Return green, orange, or red based on proximity to trial expiration."""
+    now = datetime.now(timezone.utc)
+
+    if now >= trial_end:
+        return "red"
+
+    business_days = _business_days_remaining(now, trial_end)
+    if business_days <= 2:
+        return "red"
+
+    calendar_days = (trial_end.date() - now.date()).days
+    if calendar_days <= 7:
+        return "orange"
+
+    return "green"
+
+
 
 def _normalize_signup_name(name: str) -> str:
     """Normalize a Google profile name for duplicate-name review checks."""
@@ -657,6 +691,12 @@ def confirm_trial_payment_method_return(email: str) -> None:
 def render_trial_payment_method_screen(email: str, record: Dict) -> None:
     """Require payment-method verification before starting a new free trial."""
     st.title("🚦 Smart Market")
+
+    if st.session_state.pop("_approval_just_confirmed", False):
+        st.success(
+            "Your account has been approved. Continue below to start your 30-day free trial."
+        )
+
     st.markdown("## Start your 30-day free trial")
     st.write(
         "Verify a payment method to confirm you are a real user. "
@@ -757,7 +797,7 @@ def confirm_checkout_return(email: str) -> None:
         st.success("Subscription activated. Welcome to Smart Market.")
         st.rerun()
     except Exception as exc:
-        st.error("Your payment was received, but subscription verification could not be completed.")
+        st.error("We could not confirm your subscription status. Please try again or contact support if you were charged.")
         st.caption(str(exc))
 
 
@@ -1067,10 +1107,14 @@ def access_gate(email: str) -> Dict:
             )
         st.write(f"Signed in as **{email}**")
         if st.button("Check access again"):
+            st.session_state["_access_check_requested"] = True
             st.rerun()
         if st.button("Sign out"):
             st.logout()
         st.stop()
+
+    if st.session_state.pop("_access_check_requested", False):
+        st.session_state["_approval_just_confirmed"] = True
 
     # Stripe is authoritative whenever a paid subscription already exists.
     record = sync_subscription_from_stripe(email, record)
@@ -1174,11 +1218,19 @@ def render_trial_status(record: Dict, email: str) -> None:
     trial_end = _parse_ts(record.get("trial_ends_at"))
     if not trial_end:
         return
+
     now = datetime.now(timezone.utc)
     seconds = max(0, int((trial_end - now).total_seconds()))
     days = (seconds + 86399) // 86400
     if days > 0:
-        st.caption(f"Introductory access: {days} day{'s' if days != 1 else ''} remaining")
+        message = f"Free trial: {days} day{'s' if days != 1 else ''} remaining"
+        urgency = _trial_urgency(trial_end)
+        if urgency == "red":
+            st.error(message)
+        elif urgency == "orange":
+            st.warning(message)
+        else:
+            st.success(message)
 
 def render_membership_status(record: Dict) -> None:
     """Render compact membership status for the main page header."""
@@ -1190,6 +1242,8 @@ def render_membership_status(record: Dict) -> None:
             unsafe_allow_html=True,
         )
         return
+
+    label_color = "inherit"
     subscription_status = _effective_subscription_status(record)
     cancel_at_period_end = bool(record.get("subscription_cancel_at_period_end", False))
     period_end = _parse_ts(record.get("subscription_current_period_end"))
@@ -1204,11 +1258,18 @@ def render_membership_status(record: Dict) -> None:
         now = datetime.now(timezone.utc)
         if trial_end and now < trial_end:
             label = f"Free trial until {trial_end.strftime('%b %d, %Y')}"
+            urgency = _trial_urgency(trial_end)
+            label_color = {
+                "green": "#21c55d",
+                "orange": "#f59e0b",
+                "red": "#ef4444",
+            }[urgency]
         else:
             label = "Subscription required"
+            label_color = "inherit"
 
     st.markdown(
-        f"<div style='text-align:right;font-weight:600;padding-top:0.7rem;'>{label}</div>",
+        f"<div style='text-align:right;font-weight:600;padding-top:0.7rem;color:{label_color};'>{label}</div>",
         unsafe_allow_html=True,
     )
 
