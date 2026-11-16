@@ -766,6 +766,28 @@ def create_checkout_session(email: str, record: Dict):
     return stripe.checkout.Session.create(**kwargs)
 
 
+def _get_or_create_subscription_checkout_url(email: str, record: Dict) -> tuple[Optional[str], Optional[str]]:
+    """Return a cached Stripe subscription Checkout URL for this signed-in user."""
+    cached_email = st.session_state.get("_stripe_checkout_email")
+    checkout_url = (
+        st.session_state.get("_stripe_checkout_url")
+        if cached_email == email
+        else None
+    )
+
+    if checkout_url:
+        return checkout_url, None
+
+    try:
+        session = create_checkout_session(email, record)
+        checkout_url = session.url
+        st.session_state["_stripe_checkout_url"] = checkout_url
+        st.session_state["_stripe_checkout_email"] = email
+        return checkout_url, None
+    except Exception as exc:
+        return None, str(exc)
+
+
 def confirm_checkout_return(email: str) -> None:
     params = st.query_params
     if params.get("checkout") != "success":
@@ -1028,24 +1050,11 @@ def render_subscription_screen(email: str, record: Dict) -> None:
     )
 
     # Prepare one Stripe Checkout Session before rendering the CTA so the
-    # subscription button is a direct link to Stripe (no intermediate
-    # Streamlit rerun/redirect page). Reuse it for the current browser
-    # session to avoid creating a new Checkout Session on every rerun.
-    cached_email = st.session_state.get("_stripe_checkout_email")
-    checkout_url = (
-        st.session_state.get("_stripe_checkout_url")
-        if cached_email == email
-        else None
+    # subscription button is a direct link to Stripe. The same helper is used
+    # by the free-trial sidebar Subscribe link.
+    checkout_url, checkout_error = _get_or_create_subscription_checkout_url(
+        email, record
     )
-    checkout_error = None
-    if not checkout_url:
-        try:
-            session = create_checkout_session(email, record)
-            checkout_url = session.url
-            st.session_state["_stripe_checkout_url"] = checkout_url
-            st.session_state["_stripe_checkout_email"] = email
-        except Exception as exc:
-            checkout_error = str(exc)
 
     if checkout_url:
         st.link_button(
@@ -1231,6 +1240,18 @@ def render_trial_status(record: Dict, email: str) -> None:
             st.warning(message)
         else:
             st.success(message)
+
+        checkout_url, checkout_error = _get_or_create_subscription_checkout_url(
+            email, record
+        )
+        if checkout_url:
+            st.link_button(
+                "Subscribe",
+                checkout_url,
+                use_container_width=True,
+            )
+        elif checkout_error:
+            st.caption("Subscription checkout is temporarily unavailable.")
 
 def render_membership_status(record: Dict) -> None:
     """Render compact membership status for the main page header."""
