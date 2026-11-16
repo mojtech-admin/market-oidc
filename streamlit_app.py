@@ -568,20 +568,33 @@ def create_trial_payment_method_session(email: str, record: Dict):
     stripe.api_key = _stripe_secret_key()
     base = _app_base_url()
 
+    customer_id = str(record.get("stripe_customer_id") or "").strip()
+    if not customer_id:
+        # Setup-mode Checkout does not reliably create a reusable Customer when
+        # only customer_email is supplied. Create the Stripe Customer first so
+        # the verified payment method can be attached and reused later.
+        customer = stripe.Customer.create(
+            email=email,
+            metadata={"user_email": email, "purpose": "smart_market_trial"},
+        )
+        customer_id = str(getattr(customer, "id", "") or "").strip()
+        if not customer_id:
+            raise RuntimeError("Stripe could not create a customer for this account.")
+
+        _update_subscription_record(
+            email,
+            {"stripe_customer_id": customer_id},
+        )
+
     kwargs = {
         "mode": "setup",
         "client_reference_id": email,
+        "customer": customer_id,
         "success_url": f"{base}/?trial_setup=success&session_id={{CHECKOUT_SESSION_ID}}",
         "cancel_url": f"{base}/?trial_setup=cancelled",
         "allowed_payment_method_types": ["card"],
         "metadata": {"user_email": email, "purpose": "trial_eligibility"},
     }
-
-    customer_id = str(record.get("stripe_customer_id") or "").strip()
-    if customer_id:
-        kwargs["customer"] = customer_id
-    else:
-        kwargs["customer_email"] = email
 
     return stripe.checkout.Session.create(**kwargs)
 
@@ -717,6 +730,10 @@ def confirm_trial_payment_method_return(email: str) -> None:
         st.rerun()
 
     except Exception as exc:
+        # Force the next attempt to create a fresh Stripe Setup Session rather
+        # than reusing a cached session that may have been created incorrectly.
+        st.session_state.pop("_trial_setup_checkout_url", None)
+        st.session_state.pop("_trial_setup_checkout_email", None)
         st.error("We could not verify your payment method for the free trial.")
         st.caption(str(exc))
 
