@@ -525,7 +525,7 @@ def create_trial_payment_method_session(email: str, record: Dict):
         "client_reference_id": email,
         "success_url": f"{base}/?trial_setup=success&session_id={{CHECKOUT_SESSION_ID}}",
         "cancel_url": f"{base}/?trial_setup=cancelled",
-        "payment_method_types": ["card"],
+        "allowed_payment_method_types": ["card"],
         "metadata": {"user_email": email, "purpose": "trial_eligibility"},
     }
 
