@@ -416,6 +416,20 @@ def _app_base_url() -> str:
         configured = ""
     return configured or "https://mojmarket.streamlit.app"
 
+def _is_admin(email: str) -> bool:
+    """Return True when the signed-in Google account is listed as an app admin."""
+    try:
+        admin_emails = st.secrets["app"].get("admin_emails", [])
+    except Exception:
+        admin_emails = []
+
+    normalized_admins = {
+        str(item).strip().lower()
+        for item in admin_emails
+        if str(item).strip()
+    }
+
+    return str(email or "").strip().lower() in normalized_admins
 
 def _stripe_subscription_fields(subscription) -> Dict:
     status = str(getattr(subscription, "status", "") or "inactive").lower()
@@ -998,6 +1012,11 @@ def access_gate(email: str) -> Dict:
         st.caption(str(exc))
         st.stop()
 
+    # Admin accounts bypass approval, trial, payment verification,
+    # and subscription checks.
+    if _is_admin(email):
+        return {**record, "_is_admin": True}
+
     status = str(record.get("status", "pending")).lower()
 
     if status == "denied":
@@ -1060,6 +1079,9 @@ def access_gate(email: str) -> Dict:
 
 
 def render_trial_status(record: Dict, email: str) -> None:
+    if record.get("_is_admin"):
+        st.caption("Administrator access")
+        return
     subscription_status = str(record.get("subscription_status") or "inactive").lower()
     cancel_at_period_end = bool(record.get("subscription_cancel_at_period_end", False))
     period_end = _parse_ts(record.get("subscription_current_period_end"))
@@ -1135,6 +1157,14 @@ def render_trial_status(record: Dict, email: str) -> None:
 
 def render_membership_status(record: Dict) -> None:
     """Render compact membership status for the main page header."""
+    if record.get("_is_admin"):
+    st.markdown(
+        "<div style='text-align:right;font-weight:600;padding-top:0.7rem;'>"
+        "Administrator"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    return
     subscription_status = str(record.get("subscription_status") or "inactive").lower()
     cancel_at_period_end = bool(record.get("subscription_cancel_at_period_end", False))
     period_end = _parse_ts(record.get("subscription_current_period_end"))
