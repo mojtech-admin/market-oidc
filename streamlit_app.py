@@ -829,9 +829,34 @@ def sync_subscription_from_stripe(email: str, record: Dict) -> Dict:
         subscription = stripe.Subscription.retrieve(sub_id)
         fields = _stripe_subscription_fields(subscription)
         updated = _update_subscription_record(email, fields)
-        return {**record, **updated}
-    except Exception:
-        return record
+        return {**record, **updated, "_stripe_sync_failed": False}
+    except Exception as exc:
+        # Preserve the last known record, but mark that live Stripe verification
+        # failed so downstream access logic does not blindly trust stale state.
+        return {
+            **record,
+            "_stripe_sync_failed": True,
+            "_stripe_sync_error": str(exc),
+        }
+
+
+def _effective_subscription_status(record: Dict) -> str:
+    """Return the access-relevant subscription state.
+
+    A stored active/trialing state must not grant access after its known billing
+    period has ended. This protects against stale Supabase rows when a scheduled
+    cancellation has already passed or a Stripe refresh temporarily fails.
+    """
+    status = str(record.get("subscription_status") or "inactive").lower()
+
+    if status not in {"active", "trialing"}:
+        return status
+
+    period_end = _parse_ts(record.get("subscription_current_period_end"))
+    if period_end and datetime.now(timezone.utc) >= period_end:
+        return "canceled"
+
+    return status
 
 
 
@@ -906,7 +931,7 @@ def render_payment_recovery_screen(email: str, record: Dict) -> None:
 
     if st.button("Check payment status"):
         refreshed = sync_subscription_from_stripe(email, record)
-        refreshed_status = str(refreshed.get("subscription_status") or "inactive").lower()
+        refreshed_status = _effective_subscription_status(refreshed)
         if refreshed_status in {"active", "trialing"}:
             st.success("Payment status restored.")
         st.rerun()
@@ -937,7 +962,7 @@ def render_subscription_screen(email: str, record: Dict) -> None:
         <div style="max-width:620px;padding:1.5rem 1.6rem;border:1px solid #444;"
         "border-radius:1rem;margin:1rem 0 1.25rem 0;">
           <div style="font-size:1.1rem;font-weight:700;">MOJ Market Subscription</div>
-          <div style="font-size:2rem;font-weight:800;margin-top:.35rem;">$49.99/month</div>
+          <div style="font-size:2rem;font-weight:800;margin-top:.35rem;">$121.00/month</div>
           <div style="margin-top:.6rem;opacity:.88;">Full access to the market and stock traffic-light dashboard and your saved universe.</div>
         </div>
         """,
@@ -1049,7 +1074,7 @@ def access_gate(email: str) -> Dict:
 
     # Stripe is authoritative whenever a paid subscription already exists.
     record = sync_subscription_from_stripe(email, record)
-    subscription_status = str(record.get("subscription_status") or "inactive").lower()
+    subscription_status = _effective_subscription_status(record)
 
     if subscription_status in {"active", "trialing"}:
         return record
@@ -1082,7 +1107,7 @@ def render_trial_status(record: Dict, email: str) -> None:
     if record.get("_is_admin"):
         st.caption("Administrator access")
         return
-    subscription_status = str(record.get("subscription_status") or "inactive").lower()
+    subscription_status = _effective_subscription_status(record)
     cancel_at_period_end = bool(record.get("subscription_cancel_at_period_end", False))
     period_end = _parse_ts(record.get("subscription_current_period_end"))
 
@@ -1141,7 +1166,7 @@ def render_trial_status(record: Dict, email: str) -> None:
                             st.error("Could not cancel the subscription.")
                             st.caption(str(exc))
                 with col2:
-                    if st.button("Keep Subscription - $49.99/month", key="keep_subscription"):
+                    if st.button("Keep Subscription - $121.00/month", key="keep_subscription"):
                         st.session_state[confirm_key] = False
                         st.rerun()
         return
@@ -1165,7 +1190,7 @@ def render_membership_status(record: Dict) -> None:
             unsafe_allow_html=True,
         )
         return
-    subscription_status = str(record.get("subscription_status") or "inactive").lower()
+    subscription_status = _effective_subscription_status(record)
     cancel_at_period_end = bool(record.get("subscription_cancel_at_period_end", False))
     period_end = _parse_ts(record.get("subscription_current_period_end"))
 
