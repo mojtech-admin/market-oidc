@@ -1158,13 +1158,13 @@ def render_trial_status(record: Dict, email: str) -> None:
 def render_membership_status(record: Dict) -> None:
     """Render compact membership status for the main page header."""
     if record.get("_is_admin"):
-    st.markdown(
-        "<div style='text-align:right;font-weight:600;padding-top:0.7rem;'>"
-        "Administrator"
-        "</div>",
-        unsafe_allow_html=True,
-    )
-    return
+        st.markdown(
+            "<div style='text-align:right;font-weight:600;padding-top:0.7rem;'>"
+            "Administrator"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        return
     subscription_status = str(record.get("subscription_status") or "inactive").lower()
     cancel_at_period_end = bool(record.get("subscription_cancel_at_period_end", False))
     period_end = _parse_ts(record.get("subscription_current_period_end"))
