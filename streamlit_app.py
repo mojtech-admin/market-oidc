@@ -609,6 +609,35 @@ def _payment_method_fields_from_id(payment_method_id: str, email: str) -> Dict:
     }
 
 
+def _set_customer_default_payment_method(customer_id: str, payment_method_id: str) -> None:
+    """Make the verified trial card the Stripe customer's default payment method.
+
+    Raw card details remain in Stripe. Smart Market stores only Stripe IDs and
+    non-sensitive card metadata. Checkout can then present the saved card when
+    the same Customer later chooses to subscribe.
+    """
+    if not customer_id or not payment_method_id:
+        raise RuntimeError("Stripe customer or payment method is missing.")
+
+    stripe.api_key = _stripe_secret_key()
+
+    payment_method = stripe.PaymentMethod.retrieve(payment_method_id)
+    attached_customer = str(getattr(payment_method, "customer", "") or "").strip()
+
+    if attached_customer and attached_customer != customer_id:
+        raise RuntimeError(
+            "The verified payment method belongs to a different Stripe customer."
+        )
+
+    if not attached_customer:
+        stripe.PaymentMethod.attach(payment_method_id, customer=customer_id)
+
+    stripe.Customer.modify(
+        customer_id,
+        invoice_settings={"default_payment_method": payment_method_id},
+    )
+
+
 def confirm_trial_payment_method_return(email: str) -> None:
     """Finalize the pre-trial card check after Stripe Checkout returns."""
     params = st.query_params
@@ -638,9 +667,13 @@ def confirm_trial_payment_method_return(email: str) -> None:
         payment_method_id = str(getattr(payment_method, "id", payment_method) or "")
         if not payment_method_id:
             raise RuntimeError("Stripe did not return a payment method.")
+        if not customer_id:
+            raise RuntimeError("Stripe did not return a customer for the verified payment method.")
+
+        _set_customer_default_payment_method(customer_id, payment_method_id)
 
         fields = _payment_method_fields_from_id(payment_method_id, email)
-        fields["stripe_customer_id"] = customer_id or None
+        fields["stripe_customer_id"] = customer_id
 
         reused = bool(fields.get("card_fingerprint_reused"))
         if reused:
@@ -759,6 +792,10 @@ def create_checkout_session(email: str, record: Dict):
 
     customer_id = str(record.get("stripe_customer_id") or "").strip()
     if customer_id:
+        # Reuse the Stripe Customer created during trial verification. Because
+        # the verified card is set as this Customer's default payment method,
+        # Stripe Checkout can present the saved card instead of requiring the
+        # user to type the card details again.
         kwargs["customer"] = customer_id
     else:
         kwargs["customer_email"] = email
